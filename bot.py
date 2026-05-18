@@ -6,10 +6,11 @@ Add/remove/list reminders from Telegram. Runs 24/7 on Railway.
 import os
 import json
 import logging
+import requests
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from twilio.rest import Client
 
 # ── Config from environment variables ──────────────────
@@ -20,6 +21,7 @@ TWILIO_PHONE = os.environ["TWILIO_PHONE"]
 YOUR_PHONE = os.environ["YOUR_PHONE"]
 TIMEZONE = os.environ.get("TIMEZONE", "Asia/Kolkata")
 ALLOWED_USER = os.environ.get("TELEGRAM_USER_ID", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
 REMINDERS_FILE = "reminders.json"
 tz = ZoneInfo(TIMEZONE)
@@ -82,7 +84,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "CallMe Bot\n\n"
-        "Commands:\n"
+        "Just type naturally:\n"
+        "  remind me to call Bachcha at 10:17\n"
+        "  cancel Netflix trial tomorrow at 9am\n\n"
+        "Or use commands:\n"
         "/add Cancel Netflix trial | 2026-05-25 10:00\n"
         "/list — Show all reminders\n"
         "/remove 3 — Remove reminder #3\n"
@@ -305,6 +310,145 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
         save_reminders(reminders)
 
 
+# ── Natural language parsing via Groq ──────────────────
+def parse_with_groq(user_text):
+    """Send user text to Groq LLM to extract reminder message and datetime."""
+    if not GROQ_API_KEY:
+        return None
+
+    now = datetime.now(tz)
+    today = now.strftime("%Y-%m-%d")
+    current_time = now.strftime("%H:%M")
+    weekday = now.strftime("%A")
+
+    system_prompt = f"""You extract reminders from natural language. 
+Today is {weekday}, {today}. Current time is {current_time} IST.
+
+Extract:
+1. "message" — what to remind about (clean, concise, imperative form, e.g. "Call Bachcha", "Cancel Netflix trial")
+2. "datetime" — when to call, in format YYYY-MM-DD HH:MM
+
+Handle relative times:
+- "at 10:17" = today at 10:17 (if not passed), else tomorrow
+- "tomorrow at 9am" = tomorrow 09:00
+- "in 2 hours" = {current_time} + 2 hours
+- "next Monday at 3pm" = next Monday 15:00
+
+Return ONLY a JSON object, no markdown, no backticks, no explanation:
+{{"message": "...", "datetime": "YYYY-MM-DD HH:MM"}}
+
+If you cannot parse a valid reminder, return:
+{{"message": null, "datetime": null}}"""
+
+    try:
+        resp = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
+            json={
+                "model": "llama-3.1-8b-instant",
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_text}
+                ],
+                "temperature": 0,
+                "max_tokens": 150
+            },
+            timeout=10
+        )
+        data = resp.json()
+        text = data["choices"][0]["message"]["content"].strip()
+        # Clean any markdown fences
+        text = text.replace("```json", "").replace("```", "").strip()
+        parsed = json.loads(text)
+        if parsed.get("message") and parsed.get("datetime"):
+            return parsed
+        return None
+    except Exception as e:
+        logger.error(f"Groq parse error: {e}")
+        return None
+
+
+async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle plain text messages as natural language reminders."""
+    if not is_authorized(update):
+        return
+
+    text = update.message.text.strip()
+    if not text:
+        return
+
+    if not GROQ_API_KEY:
+        await update.message.reply_text(
+            "Natural language not enabled (no GROQ_API_KEY).\n"
+            "Use: /add Message | YYYY-MM-DD HH:MM"
+        )
+        return
+
+    # Show typing indicator
+    await update.message.chat.send_action("typing")
+
+    parsed = parse_with_groq(text)
+
+    if not parsed:
+        await update.message.reply_text(
+            "Couldn't parse that as a reminder.\n"
+            "Try something like: remind me to call Bachcha at 10:17\n"
+            "Or use: /add Call Bachcha | 2026-05-18 10:17"
+        )
+        return
+
+    message = parsed["message"]
+    time_str = parsed["datetime"]
+
+    # Validate the datetime
+    try:
+        dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
+    except ValueError:
+        await update.message.reply_text(f"LLM returned invalid time: {time_str}. Use /add instead.")
+        return
+
+    now = datetime.now(tz)
+    call_dt = dt.replace(tzinfo=tz)
+    if call_dt < now:
+        await update.message.reply_text(
+            f"That time ({time_str}) is in the past.\n"
+            f"Current time: {now.strftime('%Y-%m-%d %H:%M')} IST"
+        )
+        return
+
+    reminders = load_reminders()
+    reminder = {
+        "id": next_id(reminders),
+        "message": message,
+        "call_time": time_str,
+        "status": "pending"
+    }
+    reminders.append(reminder)
+    save_reminders(reminders)
+
+    diff = call_dt - now
+    days = diff.days
+    hours = diff.seconds // 3600
+    mins = (diff.seconds % 3600) // 60
+
+    time_until = ""
+    if days > 0:
+        time_until = f"{days}d {hours}h from now"
+    elif hours > 0:
+        time_until = f"{hours}h {mins}m from now"
+    else:
+        time_until = f"{mins}m from now"
+
+    await update.message.reply_text(
+        f"Added #{reminder['id']}\n"
+        f"{message}\n"
+        f"Call at: {time_str} IST ({time_until})"
+    )
+
+
 # ── Main ───────────────────────────────────────────────
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
@@ -317,6 +461,9 @@ def main():
     app.add_handler(CommandHandler("clear", cmd_clear))
     app.add_handler(CommandHandler("test", cmd_test))
     app.add_handler(CommandHandler("myid", cmd_myid))
+
+    # Natural language — catches any plain text that isn't a command
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_natural_message))
 
     # Check reminders every 30 seconds
     app.job_queue.run_repeating(check_reminders, interval=30, first=5)
