@@ -18,7 +18,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 TWILIO_SID = os.environ["TWILIO_SID"]
 TWILIO_AUTH = os.environ["TWILIO_AUTH"]
 TWILIO_PHONE = os.environ["TWILIO_PHONE"]
-YOUR_PHONE = os.environ["YOUR_PHONE"]
+YOUR_PHONES = [p.strip() for p in os.environ["YOUR_PHONE"].split(",")]
 TIMEZONE = os.environ.get("TIMEZONE", "Asia/Kolkata")
 ALLOWED_USER = os.environ.get("TELEGRAM_USER_ID", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
@@ -50,7 +50,8 @@ def next_id(reminders):
 
 
 # ── Twilio ─────────────────────────────────────────────
-def make_call(message):
+def make_call(message, phones=None):
+    """Call one or more phones. Returns list of (phone, sid) tuples."""
     client = Client(TWILIO_SID, TWILIO_AUTH)
     twiml = (
         f'<Response>'
@@ -66,8 +67,12 @@ def make_call(message):
         f'End of reminder. Goodbye.</Say>'
         f'</Response>'
     )
-    call = client.calls.create(twiml=twiml, to=YOUR_PHONE, from_=TWILIO_PHONE)
-    return call.sid
+    targets = phones or YOUR_PHONES
+    results = []
+    for phone in targets:
+        call = client.calls.create(twiml=twiml, to=phone, from_=TWILIO_PHONE)
+        results.append((phone, call.sid))
+    return results
 
 
 # ── Auth ───────────────────────────────────────────────
@@ -77,23 +82,65 @@ def is_authorized(update: Update) -> bool:
     return str(update.effective_user.id) == ALLOWED_USER
 
 
+# ── Helper: add a single reminder ─────────────────────
+def add_single_reminder(message, time_str, reminders):
+    """Validate and add one reminder. Returns (reminder, error_string)."""
+    try:
+        dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
+    except ValueError:
+        return None, f"Invalid time format: {time_str}"
+
+    now = datetime.now(tz)
+    call_dt = dt.replace(tzinfo=tz)
+    if call_dt < now:
+        return None, f"Time {time_str} is in the past (now: {now.strftime('%Y-%m-%d %H:%M')})"
+
+    reminder = {
+        "id": next_id(reminders),
+        "message": message,
+        "call_time": time_str,
+        "status": "pending"
+    }
+    reminders.append(reminder)
+    return reminder, None
+
+
+def format_time_until(time_str):
+    """Return human-friendly 'Xd Yh from now' string."""
+    now = datetime.now(tz)
+    dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M").replace(tzinfo=tz)
+    diff = dt - now
+    days = diff.days
+    hours = diff.seconds // 3600
+    mins = (diff.seconds % 3600) // 60
+    if days > 0:
+        return f"{days}d {hours}h from now"
+    elif hours > 0:
+        return f"{hours}h {mins}m from now"
+    else:
+        return f"{mins}m from now"
+
+
 # ── Bot commands ───────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         await update.message.reply_text("Not authorized.")
         return
+    phones_str = ", ".join(YOUR_PHONES)
     await update.message.reply_text(
         "CallMe Bot\n\n"
         "Just type naturally:\n"
         "  remind me to call Bachcha at 10:17\n"
-        "  cancel Netflix trial tomorrow at 9am\n\n"
+        "  cancel Netflix trial tomorrow at 9am\n"
+        "  call me 3 times to cancel Grok: 7pm, 8pm, 9pm day after tomorrow\n\n"
         "Or use commands:\n"
         "/add Cancel Netflix trial | 2026-05-25 10:00\n"
         "/list — Show all reminders\n"
         "/remove 3 — Remove reminder #3\n"
         "/clear — Remove completed reminders\n"
         "/test — Make a test call now\n"
-        "/myid — Show your Telegram user ID"
+        "/myid — Show your Telegram user ID\n\n"
+        f"Calling: {phones_str}"
     )
 
 
@@ -114,55 +161,20 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = parts[0].strip()
     time_str = parts[1].strip()
 
-    # Try parsing the datetime
-    try:
-        dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
-    except ValueError:
-        await update.message.reply_text(
-            "Could not parse the time.\n"
-            "Use format: YYYY-MM-DD HH:MM\n"
-            "Example: 2026-05-25 10:00"
-        )
-        return
-
-    # Check if the time is in the past
-    now = datetime.now(tz)
-    call_dt = dt.replace(tzinfo=tz)
-    if call_dt < now:
-        await update.message.reply_text(
-            f"That time ({time_str}) is in the past.\n"
-            f"Current time: {now.strftime('%Y-%m-%d %H:%M')} IST"
-        )
-        return
-
     reminders = load_reminders()
-    reminder = {
-        "id": next_id(reminders),
-        "message": message,
-        "call_time": time_str,
-        "status": "pending"
-    }
-    reminders.append(reminder)
+    reminder, error = add_single_reminder(message, time_str, reminders)
+
+    if error:
+        await update.message.reply_text(error)
+        return
+
     save_reminders(reminders)
-
-    # Calculate days/hours until call
-    diff = call_dt - now
-    days = diff.days
-    hours = diff.seconds // 3600
-    mins = (diff.seconds % 3600) // 60
-
-    time_until = ""
-    if days > 0:
-        time_until = f"{days}d {hours}h from now"
-    elif hours > 0:
-        time_until = f"{hours}h {mins}m from now"
-    else:
-        time_until = f"{mins}m from now"
+    tu = format_time_until(time_str)
 
     await update.message.reply_text(
         f"Added #{reminder['id']}\n"
         f"{message}\n"
-        f"Call at: {time_str} IST ({time_until})"
+        f"Call at: {time_str} IST ({tu})"
     )
 
 
@@ -246,8 +258,9 @@ async def cmd_test(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Placing test call...")
     try:
-        sid = make_call("This is a test. Your reminder system is working.")
-        await update.message.reply_text(f"Call placed. Your phone should ring soon.\nSID: {sid}")
+        results = make_call("This is a test. Your reminder system is working.")
+        lines = [f"Called {phone} — SID: {sid}" for phone, sid in results]
+        await update.message.reply_text("Call placed.\n" + "\n".join(lines))
     except Exception as e:
         await update.message.reply_text(f"Error: {e}")
 
@@ -275,18 +288,18 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
         if now >= call_time:
             logger.info(f"FIRING #{r['id']}: {r['message']}")
             try:
-                sid = make_call(r["message"])
+                results = make_call(r["message"])
                 r["status"] = "done"
                 r["called_at"] = now.strftime("%Y-%m-%d %H:%M:%S")
-                r["call_sid"] = sid
+                r["call_sids"] = [sid for _, sid in results]
                 changed = True
 
-                # Also notify on Telegram
                 if ALLOWED_USER:
                     try:
+                        phones_called = ", ".join(p for p, _ in results)
                         await context.bot.send_message(
                             chat_id=int(ALLOWED_USER),
-                            text=f"Called you for #{r['id']}: {r['message']}"
+                            text=f"Called for #{r['id']}: {r['message']}\nPhones: {phones_called}"
                         )
                     except Exception:
                         pass
@@ -301,7 +314,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                     try:
                         await context.bot.send_message(
                             chat_id=int(ALLOWED_USER),
-                            text=f"FAILED to call for #{r['id']}: {r['message']}\nError: {e}"
+                            text=f"FAILED #{r['id']}: {r['message']}\nError: {e}"
                         )
                     except Exception:
                         pass
@@ -312,7 +325,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
 
 # ── Natural language parsing via Groq ──────────────────
 def parse_with_groq(user_text):
-    """Send user text to Groq LLM to extract reminder message and datetime."""
+    """Send user text to Groq LLM. Returns a LIST of {message, datetime} dicts."""
     if not GROQ_API_KEY:
         return None
 
@@ -321,24 +334,33 @@ def parse_with_groq(user_text):
     current_time = now.strftime("%H:%M")
     weekday = now.strftime("%A")
 
-    system_prompt = f"""You extract reminders from natural language. 
+    system_prompt = f"""You extract reminders from natural language.
 Today is {weekday}, {today}. Current time is {current_time} IST.
 
-Extract:
-1. "message" — what to remind about (clean, concise, imperative form, e.g. "Call Bachcha", "Cancel Netflix trial")
-2. "datetime" — when to call, in format YYYY-MM-DD HH:MM
+The user may give you ONE or MULTIPLE reminders in a single message.
+
+For EACH reminder, extract:
+1. "message" — what to remind about (clean, concise, imperative form)
+2. "datetime" — when to call, format YYYY-MM-DD HH:MM (24-hour)
 
 Handle relative times:
-- "at 10:17" = today at 10:17 (if not passed), else tomorrow
+- "at 10:17" = today at 10:17 (if not passed yet), else tomorrow
 - "tomorrow at 9am" = tomorrow 09:00
-- "in 2 hours" = {current_time} + 2 hours
+- "in 2 hours" = current time + 2 hours
 - "next Monday at 3pm" = next Monday 15:00
+- "day after tomorrow" = {today} + 2 days
+- "two days from now" = {today} + 2 days
 
-Return ONLY a JSON object, no markdown, no backticks, no explanation:
-{{"message": "...", "datetime": "YYYY-MM-DD HH:MM"}}
+If the user gives one reminder with multiple times (e.g. "call me 3 times: 7pm, 8pm, 9pm"), create SEPARATE reminders for each time with the same message.
 
-If you cannot parse a valid reminder, return:
-{{"message": null, "datetime": null}}"""
+ALWAYS return a JSON array, even for a single reminder. No markdown, no backticks, no explanation:
+[{{"message": "...", "datetime": "YYYY-MM-DD HH:MM"}}]
+
+Multiple reminders example:
+[{{"message": "Cancel Grok subscription", "datetime": "2026-05-20 19:00"}}, {{"message": "Cancel Grok subscription", "datetime": "2026-05-20 20:00"}}, {{"message": "Cancel Grok subscription", "datetime": "2026-05-20 21:00"}}]
+
+If you cannot parse anything valid, return:
+[]"""
 
     try:
         resp = requests.post(
@@ -354,18 +376,23 @@ If you cannot parse a valid reminder, return:
                     {"role": "user", "content": user_text}
                 ],
                 "temperature": 0,
-                "max_tokens": 150
+                "max_tokens": 500
             },
             timeout=10
         )
         data = resp.json()
         text = data["choices"][0]["message"]["content"].strip()
-        # Clean any markdown fences
         text = text.replace("```json", "").replace("```", "").strip()
         parsed = json.loads(text)
-        if parsed.get("message") and parsed.get("datetime"):
-            return parsed
-        return None
+
+        # Normalize: if they returned a single object, wrap in list
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+
+        # Filter valid entries
+        valid = [p for p in parsed if p.get("message") and p.get("datetime")]
+        return valid if valid else None
+
     except Exception as e:
         logger.error(f"Groq parse error: {e}")
         return None
@@ -387,66 +414,48 @@ async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
 
-    # Show typing indicator
     await update.message.chat.send_action("typing")
 
-    parsed = parse_with_groq(text)
+    parsed_list = parse_with_groq(text)
 
-    if not parsed:
+    if not parsed_list:
         await update.message.reply_text(
             "Couldn't parse that as a reminder.\n"
-            "Try something like: remind me to call Bachcha at 10:17\n"
-            "Or use: /add Call Bachcha | 2026-05-18 10:17"
-        )
-        return
-
-    message = parsed["message"]
-    time_str = parsed["datetime"]
-
-    # Validate the datetime
-    try:
-        dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
-    except ValueError:
-        await update.message.reply_text(f"LLM returned invalid time: {time_str}. Use /add instead.")
-        return
-
-    now = datetime.now(tz)
-    call_dt = dt.replace(tzinfo=tz)
-    if call_dt < now:
-        await update.message.reply_text(
-            f"That time ({time_str}) is in the past.\n"
-            f"Current time: {now.strftime('%Y-%m-%d %H:%M')} IST"
+            "Try something like:\n"
+            "  remind me to call Bachcha at 10:17\n"
+            "  cancel Grok at 7pm, 8pm, 9pm day after tomorrow\n"
+            "Or use: /add Message | 2026-05-18 10:17"
         )
         return
 
     reminders = load_reminders()
-    reminder = {
-        "id": next_id(reminders),
-        "message": message,
-        "call_time": time_str,
-        "status": "pending"
-    }
-    reminders.append(reminder)
+    added = []
+    errors = []
+
+    for item in parsed_list:
+        reminder, error = add_single_reminder(item["message"], item["datetime"], reminders)
+        if reminder:
+            added.append(reminder)
+        else:
+            errors.append(f"{item['message']}: {error}")
+
     save_reminders(reminders)
 
-    diff = call_dt - now
-    days = diff.days
-    hours = diff.seconds // 3600
-    mins = (diff.seconds % 3600) // 60
+    # Build response
+    lines = []
+    for r in added:
+        tu = format_time_until(r["call_time"])
+        lines.append(f"#{r['id']}  {r['message']}\n     {r['call_time']} IST ({tu})")
 
-    time_until = ""
-    if days > 0:
-        time_until = f"{days}d {hours}h from now"
-    elif hours > 0:
-        time_until = f"{hours}h {mins}m from now"
+    if lines:
+        response = f"Added {len(lines)} reminder{'s' if len(lines) > 1 else ''}:\n\n" + "\n\n".join(lines)
     else:
-        time_until = f"{mins}m from now"
+        response = ""
 
-    await update.message.reply_text(
-        f"Added #{reminder['id']}\n"
-        f"{message}\n"
-        f"Call at: {time_str} IST ({time_until})"
-    )
+    if errors:
+        response += "\n\nErrors:\n" + "\n".join(errors)
+
+    await update.message.reply_text(response)
 
 
 # ── Main ───────────────────────────────────────────────
