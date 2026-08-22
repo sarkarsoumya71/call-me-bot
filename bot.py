@@ -22,6 +22,10 @@ MY_PHONE = os.environ["YOUR_PHONE"]  # Your default number
 TIMEZONE = os.environ.get("TIMEZONE", "Asia/Kolkata")
 ALLOWED_USER = os.environ.get("TELEGRAM_USER_ID", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+# Groq retires models on its own schedule (llama-3.3-70b-versatile went away
+# on 2026-06-17). Overridable so the next deprecation is a Railway variable
+# change instead of a code change and redeploy.
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
 
 # PHONE_BOOK format in Railway: "GF:+919876543210,Mom:+919876543211"
 PHONE_BOOK = {}
@@ -560,6 +564,22 @@ Example recurring:
 If you cannot parse anything valid, return:
 []"""
 
+    payload = {
+        "model": GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_text}
+        ],
+        "temperature": 0,
+        # Reasoning models spend tokens thinking before they answer, so the
+        # ceiling has to clear the reasoning AND the JSON, or a multi-reminder
+        # message gets truncated mid-array
+        "max_tokens": 800
+    }
+    # Only reasoning models accept this; sending it to a plain model is a 400
+    if "gpt-oss" in GROQ_MODEL:
+        payload["reasoning_effort"] = "low"
+
     text = ""
     data = {}
     try:
@@ -569,26 +589,38 @@ If you cannot parse anything valid, return:
                 "Authorization": f"Bearer {GROQ_API_KEY}",
                 "Content-Type": "application/json"
             },
-            json={
-                "model": "llama-3.3-70b-versatile",
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_text}
-                ],
-                "temperature": 0,
-                "max_tokens": 500
-            },
-            timeout=15
+            json=payload,
+            timeout=20
         )
 
         if resp.status_code != 200:
             return None, f"Groq API error {resp.status_code}: {resp.text[:200]}"
 
         data = resp.json()
-        text = data["choices"][0]["message"]["content"].strip()
+        text = (data["choices"][0]["message"].get("content") or "").strip()
+        if not text:
+            return None, "LLM returned an empty response (all tokens went to reasoning?)"
+
         text = text.replace("```json", "").replace("```", "").strip()
         logger.info(f"Groq raw response: {text}")
-        parsed = json.loads(text)
+
+        # Reasoning models sometimes wrap the JSON in prose ("Here's the
+        # result: [...]") even when told not to. Pull the outermost array or
+        # object out of the surrounding text rather than failing the parse.
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            snippet = None
+            start = text.find("[")
+            if start != -1 and text.rfind("]") > start:
+                snippet = text[start:text.rfind("]") + 1]
+            else:
+                start = text.find("{")
+                if start != -1 and text.rfind("}") > start:
+                    snippet = text[start:text.rfind("}") + 1]
+            if snippet is None:
+                return None, f"LLM returned invalid JSON: {text[:200]}"
+            parsed = json.loads(snippet)
 
         if isinstance(parsed, dict):
             parsed = [parsed]
@@ -603,7 +635,7 @@ If you cannot parse anything valid, return:
     except KeyError:
         return None, f"Unexpected Groq response format: {str(data)[:200]}"
     except requests.Timeout:
-        return None, "Groq API timed out (15s)"
+        return None, "Groq API timed out (20s)"
     except Exception as e:
         logger.error(f"Groq parse error: {e}")
         return None, f"Error: {e}"
