@@ -7,7 +7,7 @@ import os
 import json
 import logging
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
@@ -104,8 +104,90 @@ def is_authorized(update: Update) -> bool:
     return str(update.effective_user.id) == ALLOWED_USER
 
 
+# ── Recurrence ─────────────────────────────────────────
+VALID_REPEATS = ("daily", "weekly", "monthly", "weekdays")
+
+
+def _advance_one(dt, repeat, anchor_day=None):
+    """Advance a datetime by one step of the repeat rule."""
+    if repeat == "daily":
+        return dt + timedelta(days=1)
+    if repeat == "weekly":
+        return dt + timedelta(days=7)
+    if repeat == "weekdays":
+        dt = dt + timedelta(days=1)
+        while dt.weekday() >= 5:  # Sat=5, Sun=6
+            dt = dt + timedelta(days=1)
+        return dt
+    if repeat == "monthly":
+        month = dt.month + 1
+        year = dt.year
+        if month > 12:
+            month = 1
+            year += 1
+        # Use the original day-of-month so Feb 28 does not permanently
+        # shrink a "31st of every month" reminder
+        day = anchor_day or dt.day
+        while day > 0:
+            try:
+                return dt.replace(year=year, month=month, day=day)
+            except ValueError:
+                day -= 1
+    return None
+
+
+def next_occurrence(time_str, repeat, anchor_day=None):
+    """Given a fired reminder's time and repeat rule, return the next time string."""
+    if repeat not in VALID_REPEATS:
+        return None
+
+    dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
+    dt = _advance_one(dt, repeat, anchor_day)
+    if dt is None:
+        return None
+
+    # Roll forward until strictly in the future. Guard against runaway loops.
+    now = datetime.now(tz)
+    guard = 0
+    while dt.replace(tzinfo=tz) <= now and guard < 500:
+        dt = _advance_one(dt, repeat, anchor_day)
+        if dt is None:
+            return None
+        guard += 1
+
+    if dt.replace(tzinfo=tz) <= now:
+        return None  # Give up rather than schedule a past-time loop
+
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def build_next_instance(r, target_phone, who):
+    """If r is recurring, build the dict for its next instance (id assigned later)."""
+    repeat = r.get("repeat")
+    if not repeat:
+        return None
+    anchor = r.get("anchor_day")
+    next_time = next_occurrence(r["call_time"], repeat, anchor)
+    if not next_time:
+        logger.warning(
+            f"Could not compute next occurrence for #{r['id']} ({repeat}); chain ends here"
+        )
+        return None
+    nr = {
+        "message": r["message"],
+        "call_time": next_time,
+        "phone": target_phone,
+        "who": who,
+        "repeat": repeat,
+        "status": "pending"
+    }
+    if anchor:
+        nr["anchor_day"] = anchor
+    return nr
+
+
 # ── Helper: add a single reminder ─────────────────────
-def add_single_reminder(message, time_str, reminders, who=None):
+def add_single_reminder(message, time_str, reminders, who=None, repeat=None):
     """Validate and add one reminder. Returns (reminder, error_string)."""
     try:
         dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
@@ -119,14 +201,24 @@ def add_single_reminder(message, time_str, reminders, who=None):
 
     phone, display_name = resolve_phone(who)
 
+    if repeat and repeat.lower() not in VALID_REPEATS:
+        repeat = None
+
+    repeat = repeat.lower() if repeat else None
+
     reminder = {
         "id": next_id(reminders),
         "message": message,
         "call_time": time_str,
         "phone": phone,
         "who": display_name,
+        "repeat": repeat,
         "status": "pending"
     }
+    # For monthly, remember the original day so "31st" survives short months
+    if repeat == "monthly":
+        reminder["anchor_day"] = dt.day
+
     reminders.append(reminder)
     return reminder, None
 
@@ -162,6 +254,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  cancel Netflix trial tomorrow at 9am\n"
         "  call me 3 times to cancel Grok: 7pm, 8pm, 9pm\n"
         "  remind GF to take medicine at 8pm\n\n"
+        "Recurring:\n"
+        "  every Monday at 9am remind me to review goals\n"
+        "  every weekday at 7am remind me to send cold emails\n"
+        "  every month on the 1st remind me to pay rent\n\n"
+        "Rules: daily, weekly, weekdays (Mon-Fri), monthly.\n"
+        "Recurring reminders show ↻ in /list. Use /remove to stop one.\n\n"
         "Or use commands:\n"
         "/add Cancel Netflix trial | 2026-05-25 10:00\n"
         "/list — Show all reminders\n"
@@ -227,7 +325,8 @@ async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for r in sorted(pending, key=lambda x: x["call_time"]):
             who = r.get("who", "me")
             who_tag = f" [{who}]" if who != "me" else ""
-            text += f"  #{r['id']}  {r['call_time']}  {r['message']}{who_tag}\n"
+            rep_tag = f" ↻{r['repeat']}" if r.get("repeat") else ""
+            text += f"  #{r['id']}  {r['call_time']}  {r['message']}{who_tag}{rep_tag}\n"
 
     if done:
         text += "\nDONE:\n"
@@ -259,9 +358,11 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reminders = load_reminders()
     original = len(reminders)
     removed_msg = None
+    was_recurring = False
     for r in reminders:
         if r["id"] == rid:
             removed_msg = r["message"]
+            was_recurring = bool(r.get("repeat"))
             break
     reminders = [r for r in reminders if r["id"] != rid]
 
@@ -270,7 +371,8 @@ async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     save_reminders(reminders)
-    await update.message.reply_text(f"Removed #{rid}: {removed_msg}")
+    note = "\nRecurring chain stopped." if was_recurring else ""
+    await update.message.reply_text(f"Removed #{rid}: {removed_msg}{note}")
 
 
 async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -327,6 +429,8 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
     reminders = load_reminders()
     changed = False
 
+    new_reminders = []
+
     for r in reminders:
         if r["status"] != "pending":
             continue
@@ -337,6 +441,7 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"FIRING #{r['id']}: {r['message']}")
             target_phone = r.get("phone", MY_PHONE)
             who = r.get("who", "me")
+            who_tag = f" [{who}]" if who != "me" else ""
             try:
                 sid = make_call(r["message"], phone=target_phone)
                 r["status"] = "done"
@@ -344,12 +449,19 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                 r["call_sid"] = sid
                 changed = True
 
+                # If recurring, queue up the next occurrence
+                queued = build_next_instance(r, target_phone, who)
+                if queued:
+                    new_reminders.append(queued)
+
                 if ALLOWED_USER:
                     try:
-                        who_tag = f" [{who}]" if who != "me" else ""
+                        repeat_tag = ""
+                        if queued:
+                            repeat_tag = f"\nNext: {queued['call_time']} ({queued['repeat']})"
                         await context.bot.send_message(
                             chat_id=int(ALLOWED_USER),
-                            text=f"Called for #{r['id']}: {r['message']}{who_tag}"
+                            text=f"Called for #{r['id']}: {r['message']}{who_tag}{repeat_tag}"
                         )
                     except Exception:
                         pass
@@ -360,14 +472,29 @@ async def check_reminders(context: ContextTypes.DEFAULT_TYPE):
                 r["error"] = str(e)
                 changed = True
 
+                # A recurring reminder has to survive one bad call. Without this,
+                # a single transient Twilio error silently kills the whole chain.
+                queued = build_next_instance(r, target_phone, who)
+                if queued:
+                    new_reminders.append(queued)
+
                 if ALLOWED_USER:
                     try:
+                        repeat_tag = ""
+                        if queued:
+                            repeat_tag = f"\nStill scheduled: {queued['call_time']} ({queued['repeat']})"
                         await context.bot.send_message(
                             chat_id=int(ALLOWED_USER),
-                            text=f"FAILED #{r['id']}: {r['message']}\nError: {e}"
+                            text=f"FAILED #{r['id']}: {r['message']}\nError: {e}{repeat_tag}"
                         )
                     except Exception:
                         pass
+
+    # Add re-armed recurring reminders with fresh IDs
+    for nr in new_reminders:
+        nr["id"] = next_id(reminders)
+        reminders.append(nr)
+        logger.info(f"Re-armed #{nr['id']} for {nr['call_time']} ({nr['repeat']})")
 
     if changed:
         save_reminders(reminders)
@@ -394,8 +521,19 @@ The user may give you ONE or MULTIPLE reminders in a single message.
 
 For EACH reminder, extract:
 1. "message" — what to remind about (clean, concise, imperative form)
-2. "datetime" — when to call, format YYYY-MM-DD HH:MM (24-hour)
+2. "datetime" — when to call, format YYYY-MM-DD HH:MM (24-hour). This is the FIRST occurrence.
 3. "who" — who to call. Default is "me". If the user says "remind GF", "tell Mom", "call GF" etc, use that name. Known contacts: {contact_names}
+4. "repeat" — recurrence rule, or null for one-time reminders. Valid values ONLY: "daily", "weekly", "monthly", "weekdays", or null
+
+Recurrence detection:
+- "every day", "daily" → "daily"
+- "every Monday", "weekly", "every week" → "weekly"
+- "every month", "monthly", "on the 1st of every month" → "monthly"
+- "every weekday", "Mon-Fri", "on weekdays" → "weekdays"
+- No recurrence words → null
+
+For recurring reminders, "datetime" must be the NEXT time it should fire.
+Example: "every Monday at 9am" and today is Wednesday → datetime = the upcoming Monday at 09:00, repeat = "weekly"
 
 Handle relative times:
 - "at 10:17" = today at 10:17 (if not passed yet), else tomorrow
@@ -411,14 +549,19 @@ If a reminder has no specific time, default to 09:00 on that day.
 If a reminder has no specific date but has a time, use today (or tomorrow if the time has passed).
 
 ALWAYS return a JSON array, even for a single reminder. No markdown, no backticks, no explanation:
-[{{"message": "...", "datetime": "YYYY-MM-DD HH:MM", "who": "me"}}]
+[{{"message": "...", "datetime": "YYYY-MM-DD HH:MM", "who": "me", "repeat": null}}]
 
 Example with contact:
-[{{"message": "Take your medicine", "datetime": "2026-05-20 20:00", "who": "GF"}}]
+[{{"message": "Take your medicine", "datetime": "2026-05-20 20:00", "who": "GF", "repeat": null}}]
+
+Example recurring:
+[{{"message": "Review weekly goals", "datetime": "2026-05-25 09:00", "who": "me", "repeat": "weekly"}}]
 
 If you cannot parse anything valid, return:
 []"""
 
+    text = ""
+    data = {}
     try:
         resp = requests.post(
             "https://api.groq.com/openai/v1/chat/completions",
@@ -427,7 +570,7 @@ If you cannot parse anything valid, return:
                 "Content-Type": "application/json"
             },
             json={
-                "model": "openai/gpt-oss-120b",
+                "model": "llama-3.3-70b-versatile",
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_text}
@@ -494,6 +637,7 @@ async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_T
             "  remind me to call Bachcha at 10:17\n"
             "  cancel Grok at 7pm, 8pm, 9pm day after tomorrow\n"
             "  remind GF to take medicine at 8pm\n"
+            "  every Monday at 9am remind me to review goals\n"
             "Or use: /add Message | 2026-05-18 10:17"
         )
         return
@@ -504,7 +648,10 @@ async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_T
 
     for item in parsed_list:
         who = item.get("who", "me")
-        reminder, err = add_single_reminder(item["message"], item["datetime"], reminders, who=who)
+        repeat = item.get("repeat")
+        reminder, err = add_single_reminder(
+            item["message"], item["datetime"], reminders, who=who, repeat=repeat
+        )
         if reminder:
             added.append(reminder)
         else:
@@ -516,7 +663,8 @@ async def handle_natural_message(update: Update, context: ContextTypes.DEFAULT_T
     for r in added:
         tu = format_time_until(r["call_time"])
         who_tag = f" [{r['who']}]" if r.get("who", "me") != "me" else ""
-        lines.append(f"#{r['id']}  {r['message']}{who_tag}\n     {r['call_time']} IST ({tu})")
+        rep_tag = f"  ↻ {r['repeat']}" if r.get("repeat") else ""
+        lines.append(f"#{r['id']}  {r['message']}{who_tag}{rep_tag}\n     {r['call_time']} IST ({tu})")
 
     if lines:
         response = f"Added {len(lines)} reminder{'s' if len(lines) > 1 else ''}:\n\n" + "\n\n".join(lines)
